@@ -1,0 +1,167 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, Dropout, Embedding, Flatten, Concatenate, Input
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.layers import MultiHeadAttention, LayerNormalization
+from tensorflow.keras.callbacks import EarlyStopping
+import matplotlib.pyplot as plt
+import json
+
+# 加载数据
+input_data = pd.read_csv('/content/input.csv')
+utci_data = pd.read_csv('/content/UTCI.csv')
+
+# 合并数据
+merged_data = pd.merge(input_data, utci_data, on=['region_id', 'timestamp'])
+merged_data['timestamp'] = pd.to_datetime(merged_data['timestamp'], format='%Y-%m-%d-%H')
+
+# 数据标准化
+scaler = StandardScaler()
+numeric_features = merged_data.drop(columns=['UTCI', 'timestamp', 'region_id'])
+X_scaled = scaler.fit_transform(numeric_features)
+y = merged_data['UTCI'].values
+
+# 确保 region_id 和 y 的数据类型
+region_ids = merged_data['region_id'].astype(np.int32).values  # 确保为 int32 类型
+y = y.astype(np.float32)  # 确保 y 为 float32 类型
+
+# 分割数据集为训练集和测试集
+X_train_numeric, X_test_numeric, X_train_region, X_test_region, y_train, y_test = train_test_split(
+    X_scaled, region_ids, y, test_size=0.2, random_state=42)
+
+# 确定唯一的 region_id 数量
+num_regions = merged_data['region_id'].nunique()
+embedding_dim = 64  # 嵌入向量的维度
+
+# 自定义 Transformer 块
+class TransformerBlock(tf.keras.layers.Layer):
+    def __init__(self, d_model, num_heads, mlp_dim, dropout=0.1):
+        super(TransformerBlock, self).__init__()
+        self.att = MultiHeadAttention(num_heads=num_heads, key_dim=d_model)
+        self.mlp = tf.keras.Sequential([
+            Dense(mlp_dim, activation='relu'),
+            Dense(d_model),
+        ])
+        self.dropout1 = Dropout(dropout)
+        self.norm1 = LayerNormalization(epsilon=1e-6)
+        self.dropout2 = Dropout(dropout)
+        self.norm2 = LayerNormalization(epsilon=1e-6)
+
+    def call(self, inputs, training=False):
+        attn_output = self.att(inputs, inputs)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.norm1(inputs + attn_output)
+        mlp_output = self.mlp(out1)
+        mlp_output = self.dropout2(mlp_output, training=training)
+        return self.norm2(out1 + mlp_output)
+
+# 构建模型
+def build_model(input_shape, num_regions, embedding_dim):
+    inputs_numeric = Input(shape=(input_shape[1],), name='numeric_inputs')
+    inputs_region = Input(shape=(), name='region_input', dtype=tf.int32)
+
+    region_embedding = Embedding(input_dim=num_regions + 1, output_dim=embedding_dim)(inputs_region)
+    region_embedding = Flatten()(region_embedding)
+
+    combined_inputs = Concatenate()([inputs_numeric, region_embedding])
+    combined_inputs = tf.expand_dims(combined_inputs, 1)  # 扩展维度以适应Transformer的输入需求
+
+    transformer_output = TransformerBlock(d_model=combined_inputs.shape[-1], num_heads=4, mlp_dim=128)(combined_inputs)
+    flattened_output = Flatten()(transformer_output)
+    dense_output = Dense(64, activation='relu')(flattened_output)
+    output = Dense(1)(dense_output)
+
+    model = Model(inputs=[inputs_numeric, inputs_region], outputs=output)
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
+    return model
+
+# 获取输入形状
+input_shape = X_train_numeric.shape
+
+# 构建和训练模型
+model = build_model(input_shape=input_shape, num_regions=num_regions, embedding_dim=embedding_dim)
+
+# 设置 EarlyStopping 回调
+early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+
+# 记录每个 epoch 的预测值和真实值
+class PredictionHistory(tf.keras.callbacks.Callback):
+    def on_train_begin(self, logs=None):
+        self.epoch_train_pred = []
+        self.epoch_val_pred = []
+
+    def on_epoch_end(self, epoch, logs=None):
+        train_pred = self.model.predict({'numeric_inputs': X_train_numeric, 'region_input': X_train_region}, verbose=0)
+        val_pred = self.model.predict({'numeric_inputs': X_test_numeric, 'region_input': X_test_region}, verbose=0)
+        self.epoch_train_pred.append(train_pred)
+        self.epoch_val_pred.append(val_pred)
+
+prediction_history = PredictionHistory()
+
+history = model.fit(
+    {'numeric_inputs': X_train_numeric, 'region_input': X_train_region},
+    y_train,
+    epochs=50,
+    batch_size=32,
+    validation_data=({'numeric_inputs': X_test_numeric, 'region_input': X_test_region}, y_test),
+    callbacks=[early_stopping, prediction_history]
+)
+
+# 保存模型权重
+model.save_weights('model_weights.h5')
+
+# 评估模型性能
+y_pred = model.predict({'numeric_inputs': X_test_numeric, 'region_input': X_test_region})
+mse = mean_squared_error(y_test, y_pred)
+r2 = r2_score(y_test, y_pred)
+
+# 保存评估数据到 CSV
+history_df = pd.DataFrame(history.history)
+history_df['mse'] = mse
+history_df['r2'] = r2
+history_df.to_csv('/content/data/evaluation_data.csv', index=False)
+
+# 打印和绘制结果
+print(f'MSE: {mse}, R^2: {r2}')
+
+# 绘制训练和验证损失曲线
+plt.figure(figsize=(12, 6))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+
+# 绘制训练和验证MAE曲线
+plt.subplot(1, 2, 2)
+plt.plot(history.history['mae'], label='Train MAE')
+plt.plot(history.history['val_mae'], label='Validation MAE')
+plt.title('Mean Absolute Error')
+plt.xlabel('Epochs')
+plt.ylabel('MAE')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# 绘制预测值与真实值随epoch的变化情况
+def plot_predictions(epoch_predictions, y_true, title):
+    plt.figure(figsize=(10, 5))
+    for epoch, preds in enumerate(epoch_predictions):
+        plt.plot(y_true, preds, 'o', label=f'Epoch {epoch+1}')
+    plt.plot(y_true, y_true, 'r--', label='True values')
+    plt.title(title)
+    plt.xlabel('True values')
+    plt.ylabel('Predicted values')
+    plt.legend()
+    plt.show()
+
+plot_predictions(prediction_history.epoch_train_pred, y_train, 'Training Predictions vs True Values')
+plot_predictions(prediction_history.epoch_val_pred, y_test, 'Validation Predictions vs True Values')
